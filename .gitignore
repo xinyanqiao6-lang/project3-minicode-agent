@@ -1,0 +1,13 @@
+# 密钥（绝对不能提交）
+.env
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# 沙箱工作目录（Agent 运行时产生的临时文件）
+workspace/
+
+# 结果缓存（实验可重跑）
+results/*.json
