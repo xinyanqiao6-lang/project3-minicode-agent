@@ -27,3 +27,11 @@ WORKSPACE = os.getenv("MINICODE_WORKSPACE", "./workspace")         # 沙箱工�
 
 # ---- 运行模式 ----
 MOCK_MODE = os.getenv("MOCK_MODE", "false").lower() in ("1", "true", "yes")
+
+# 调上游是否走系统代理。默认 false = 直连。
+# 与 project1 同理：走代理会给每次调用叠加不确定的延迟，Agent 评测数据不可信。
+UPSTREAM_TRUST_ENV = os.getenv("UPSTREAM_TRUST_ENV", "false").lower() in ("1", "true", "yes")
+
+# ---- 评测 ----
+# 基准集默认使用托管 venv 的解释器跑被测脚本，避免 "python" 指向不同的环境
+BENCH_PYTHON = os.getenv("MINICODE_BENCH_PYTHON", "")

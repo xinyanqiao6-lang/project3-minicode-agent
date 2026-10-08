@@ -11,3 +11,7 @@ workspace/
 
 # 结果缓存（实验可重跑）
 results/*.json
+
+# 评测过程数据（含 token 消耗，体积大且可复现）
+results/records_*.jsonl
+results/traces/

@@ -16,22 +16,46 @@ from . import config
 logger = logging.getLogger("minicode.llm")
 
 _client: httpx.AsyncClient | None = None
+_client_loop: object | None = None   # 记录 client 创建时所在的事件循环
 
 
 def get_client() -> httpx.AsyncClient:
-    global _client
-    if _client is None or _client.is_closed:
+    """获取共享的 AsyncClient，**但跨事件循环时必须重建**。
+
+    这是实测踩到的坑：httpx.AsyncClient 绑定在创建时的事件循环上，
+    如果在一次 `asyncio.run()` 里创建、另一次 `asyncio.run()` 里复用，
+    会直接抛 `RuntimeError: Event loop is closed`。
+    单测（每个用例一次 run_sync）与评测脚本（多次调用）都会触发，
+    所以这里记录创建时的 loop，发现变了就重建。
+    """
+    global _client, _client_loop
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+
+    if _client is None or _client.is_closed or (loop is not None and loop is not _client_loop):
+        if _client is not None and not _client.is_closed:
+            try:
+                loop.run_until_complete(_client.aclose())
+            except Exception:
+                pass
         _client = httpx.AsyncClient(
-            timeout=httpx.Timeout(config.LLM_TIMEOUT, connect=5.0)
+            timeout=httpx.Timeout(config.LLM_TIMEOUT, connect=5.0),
+            # 不走系统代理：走代理会给每次调用叠加不确定的延迟，
+            # 评测数据不可信；且部分本机代理对 absolute-URI 请求直接回 404。
+            trust_env=config.UPSTREAM_TRUST_ENV,
         )
+        _client_loop = loop
     return _client
 
 
 async def close_client():
-    global _client
+    global _client, _client_loop
     if _client is not None and not _client.is_closed:
         await _client.aclose()
-        _client = None
+    _client = None
+    _client_loop = None
 
 
 class UpstreamUnavailableError(Exception):
@@ -39,16 +63,26 @@ class UpstreamUnavailableError(Exception):
 
 
 # ---------- Mock 模式 ----------
-async def mock_chat(messages, temperature, max_tokens) -> str:
-    """无 Key 时返回一个「立即结束」的 final，让 Agent 循环能跑通（仅验证链路）。"""
+async def mock_chat(messages, temperature, max_tokens) -> tuple[str, dict]:
+    """无 Key 时返回一个「立即结束」的 final，让 Agent 循环能跑通（仅验证链路）。
+
+    返回 (文本, usage)：usage 与真实调用同构，便于下游 trace 代码无需分支。
+    """
     await asyncio.sleep(0.02)
-    return json_final("（MOCK）未配置 API Key，Agent 直接结束。配置 SILICONFLOW_API_KEY 后重试。")
+    return json_final("（MOCK）未配置 API Key，Agent 直接结束。配置 SILICONFLOW_API_KEY 后重试。"), \
+        {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
 
 
 # ---------- 真实调用（精简版韧性：超时 + 有限重试） ----------
-async def chat_completion(messages: list, temperature: float | None = None,
-                          max_tokens: int | None = None) -> str:
-    """非流式调用，返回完整文本。带超时 + 有限重试（4xx 不重试）。"""
+async def chat_completion_with_usage(
+    messages: list, temperature: float | None = None, max_tokens: int | None = None
+) -> tuple[str, dict]:
+    """非流式调用，返回 (完整文本, usage)。
+
+    与旧版 chat_completion 的区别：**把 usage 一并返回**。
+    原因：评估 Agent 的成本必须知道 token 消耗，而 OpenAI 兼容接口本来就
+    返回 usage，之前丢掉它等于把成本度量能力扔掉了。
+    """
     temperature = config.LLM_TEMPERATURE if temperature is None else temperature
     max_tokens = config.LLM_MAX_TOKENS if max_tokens is None else max_tokens
 
@@ -76,7 +110,13 @@ async def chat_completion(messages: list, temperature: float | None = None,
             continue
 
         if resp.status_code < 400:
-            return resp.json()["choices"][0]["message"]["content"]
+            data = resp.json()
+            usage = data.get("usage") or {}
+            return data["choices"][0]["message"]["content"], {
+                "prompt_tokens": int(usage.get("prompt_tokens", 0) or 0),
+                "completion_tokens": int(usage.get("completion_tokens", 0) or 0),
+                "total_tokens": int(usage.get("total_tokens", 0) or 0),
+            }
         if resp.status_code >= 500:  # 5xx 重试，4xx 直接抛
             last_err = httpx.HTTPStatusError(
                 f"HTTP {resp.status_code}", request=resp.request, response=resp
@@ -86,6 +126,13 @@ async def chat_completion(messages: list, temperature: float | None = None,
         resp.raise_for_status()
 
     raise UpstreamUnavailableError(f"上游调用失败：{last_err}")
+
+
+async def chat_completion(messages: list, temperature: float | None = None,
+                          max_tokens: int | None = None) -> str:
+    """兼容旧调用方：只要文本，不要 usage。"""
+    text, _ = await chat_completion_with_usage(messages, temperature, max_tokens)
+    return text
 
 
 # ---------- 工具：解析模型输出 ----------
